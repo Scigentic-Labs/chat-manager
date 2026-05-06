@@ -25,15 +25,30 @@ if [ -f "$_AUTO_FILE" ] && [ "$(cat "$_AUTO_FILE")" = "true" ]; then
   _REMOTE_VER=$(curl -sf --max-time 3 \
     https://raw.githubusercontent.com/Scigentic-Labs/chat-manager/main/chat_manager.py \
     | grep '^__version__' | head -1 | cut -d'"' -f2 2>/dev/null || echo "")
+  # semver-aware: only upgrade if remote > local
   if [ -n "$_REMOTE_VER" ] && [ "$_REMOTE_VER" != "$_LOCAL_VER" ]; then
-    echo "AUTO_UPGRADE $_LOCAL_VER $_REMOTE_VER"
+    _semver_gt() {
+      local IFS=.; local i; read -r -a a <<< "$1"; read -r -a b <<< "$2"
+      for i in 0 1 2; do
+        local x="${a[$i]:-0}" y="${b[$i]:-0}"
+        [ "$x" -gt "$y" ] && return 0; [ "$x" -lt "$y" ] && return 1
+      done; return 1
+    }
+    _semver_gt "$_REMOTE_VER" "$_LOCAL_VER" && echo "AUTO_UPGRADE $_LOCAL_VER $_REMOTE_VER"
   fi
 else
   _REMOTE_VER=$(curl -sf --max-time 3 \
     https://raw.githubusercontent.com/Scigentic-Labs/chat-manager/main/chat_manager.py \
     | grep '^__version__' | head -1 | cut -d'"' -f2 2>/dev/null || echo "")
   if [ -n "$_REMOTE_VER" ] && [ "$_REMOTE_VER" != "$_LOCAL_VER" ]; then
-    echo "UPGRADE_AVAILABLE $_LOCAL_VER $_REMOTE_VER"
+    _semver_gt() {
+      local IFS=.; local i; read -r -a a <<< "$1"; read -r -a b <<< "$2"
+      for i in 0 1 2; do
+        local x="${a[$i]:-0}" y="${b[$i]:-0}"
+        [ "$x" -gt "$y" ] && return 0; [ "$x" -lt "$y" ] && return 1
+      done; return 1
+    }
+    _semver_gt "$_REMOTE_VER" "$_LOCAL_VER" && echo "UPGRADE_AVAILABLE $_LOCAL_VER $_REMOTE_VER"
   fi
 fi
 ```
@@ -104,9 +119,52 @@ python3 ~/.claude/skills/chat-manager/chat_manager.py resume "<path>"
 Script prints the exact `cd ... && claude --resume ...` command (or Codex equivalent).
 For records from other machines, it also prints the SSH variant.
 
-## Delete records
+## Quarantine records
 
-Confirm with user first, then directly `rm "<path>"` (do NOT go through the script — safety check stays in the assistant layer). Re-run scan after.
+Confirm with user first, then dry-run:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py quarantine "<path>"
+```
+
+Apply only after confirmation:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py quarantine "<path>" --apply
+```
+
+The script moves the transcript under `~/.claude/chat-manager-quarantine/<timestamp>/`
+and prints a restore command. Re-run scan after.
+
+## Restore from quarantine
+
+Dry-run first:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py restore "<quarantine-path>"
+```
+
+Apply only after confirmation:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py restore "<quarantine-path>" --apply
+```
+
+Moves the file back to its original location. Fails if destination already exists.
+
+## Purge quarantine
+
+Remove quarantined files older than N days (default 7). Dry-run first:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py purge-quarantine --days 7
+```
+
+Apply only after confirmation:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py purge-quarantine --days 7 --apply
+```
 
 ## Cleanup candidates
 
@@ -115,8 +173,35 @@ python3 ~/.claude/skills/chat-manager/chat_manager.py cleanup
 ```
 Present candidates grouped by reason. Always confirm before deleting.
 
+## Secret scan
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py secrets
+```
+
+Lists sessions containing credential-shaped values without printing the values.
+
+## Redact secrets
+
+Dry-run first:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py redact-secrets
+```
+
+Apply only after confirmation:
+
+```bash
+python3 ~/.claude/skills/chat-manager/chat_manager.py redact-secrets --apply
+```
+
+The script creates backups under `~/.claude/chat-manager-redaction-backups/<timestamp>/`
+before modifying any transcript.
+
 ## Important
 
 - NEVER delete without explicit confirmation
 - The current active session cannot be deleted
+- Prefer `redact-secrets` before deleting sensitive records
+- Prefer quarantine over direct `rm`
 - Always show updated table after deletions

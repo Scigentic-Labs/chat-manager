@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """chat-manager: multi-source AI chat history reader (Claude Code + Codex)"""
 
-__version__ = "2.1.0"
+__version__ = "2.4.0"
 
 import argparse
 import glob
 import json
 import os
 import re
+import shutil
 import shlex
 import sys
 from datetime import datetime
+from pathlib import Path
 
 CONFIG_PATH = os.path.expanduser('~/.claude/chat-manager.config.json')
 
@@ -21,7 +23,11 @@ def load_config() -> list[dict]:
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
             return json.load(f)['sources']
-    return [{'type': 'claude-code', 'path': '~/.claude/projects/', 'machine': 'local'}]
+    return [
+        {'type': 'claude-code', 'path': '~/.claude/projects/', 'machine': 'local'},
+        {'type': 'codex', 'path': '~/.codex/sessions/', 'machine': 'local'},
+        {'type': 'codex', 'path': '~/.codex/archived_sessions/', 'machine': 'local'},
+    ]
 
 
 # ── Claude Code adapter ───────────────────────────────────────────────────────
@@ -233,6 +239,70 @@ def _human_size(size_bytes: int) -> str:
     return f'{size_bytes}B'
 
 
+SECRET_PATTERNS = [
+    ('api key', re.compile(r'sk-[A-Za-z0-9][A-Za-z0-9_-]{16,}')),
+    ('github token', re.compile(r'gh[pousr]_[A-Za-z0-9_]{16,}')),
+    ('codex github token assignment', re.compile(
+        r'CODEX_GH_TOKEN=(?!\[REDACTED_)[A-Za-z0-9_./:-]+'
+    )),
+    ('github token assignment', re.compile(
+        r'GH_TOKEN=(?!\[REDACTED_)[A-Za-z0-9_./:-]+'
+    )),
+    ('anthropic key assignment', re.compile(
+        r'ANTHROPIC_API_KEY=(?!\[REDACTED_)[A-Za-z0-9_./:-]+'
+    )),
+    ('openai key assignment', re.compile(
+        r'OPENAI_API_KEY=(?!\[REDACTED_)[A-Za-z0-9_./:-]+'
+    )),
+    ('tencent docker token assignment', re.compile(
+        r'TENCENT_DOCKER_REGISTRY_PWD=(?!\[REDACTED_)[A-Za-z0-9_./:-]+'
+    )),
+]
+
+
+REDACTION_PATTERNS = [
+    (re.compile(r'sk-[A-Za-z0-9][A-Za-z0-9_-]{16,}'), '[REDACTED_API_KEY]'),
+    (re.compile(r'gh[pousr]_[A-Za-z0-9_]{16,}'), '[REDACTED_GITHUB_TOKEN]'),
+    (re.compile(r'(CODEX_GH_TOKEN=)[^\n]+'), r'\1[REDACTED_GITHUB_TOKEN]'),
+    (re.compile(r'(GH_TOKEN=)[^\n]+'), r'\1[REDACTED_GITHUB_TOKEN]'),
+    (re.compile(r'(ANTHROPIC_API_KEY=)[^\n]+'), r'\1[REDACTED_API_KEY]'),
+    (re.compile(r'(OPENAI_API_KEY=)[^\n]+'), r'\1[REDACTED_API_KEY]'),
+    (
+        re.compile(r'(TENCENT_DOCKER_REGISTRY_PWD=)[^\n]+'),
+        r'\1[REDACTED_TENCENT_DOCKER_TOKEN]',
+    ),
+]
+
+
+def _secret_matches(path: str) -> list[str]:
+    try:
+        with open(path, errors='ignore') as f:
+            text = f.read()
+    except Exception:
+        return []
+
+    matches = []
+    for label, pattern in SECRET_PATTERNS:
+        if pattern.search(text):
+            matches.append(label)
+    return matches
+
+
+def _redact_text(text: str) -> tuple[str, int]:
+    redacted = text
+    replacements = 0
+    for pattern, replacement in REDACTION_PATTERNS:
+        redacted, count = pattern.subn(replacement, redacted)
+        replacements += count
+    return redacted, replacements
+
+
+def _backup_path(path: str, backup_root: str) -> str:
+    resolved = os.path.abspath(os.path.expanduser(path))
+    rel = resolved.lstrip(os.sep)
+    return os.path.join(backup_root, rel)
+
+
 def _gather_records(config: list[dict]) -> list[dict]:
     records = []
     for source in config:
@@ -247,6 +317,24 @@ def _gather_records(config: list[dict]) -> list[dict]:
                 records.append(rec)
     records.sort(key=lambda r: r['date'], reverse=True)
     return records
+
+
+def _parse_record_for_path(config: list[dict], path: str) -> dict | None:
+    basename = os.path.basename(path)
+    if basename.startswith('rollout-'):
+        return codex_parse(path, {'machine': 'local'})
+
+    for source in config:
+        adapter_type = source.get('type')
+        if adapter_type not in ADAPTERS:
+            continue
+        if adapter_type == 'codex':
+            continue
+        _, parse_fn = ADAPTERS[adapter_type]
+        r = parse_fn(path, source)
+        if r:
+            return r
+    return None
 
 
 # ── Inspect helpers ───────────────────────────────────────────────────────────
@@ -405,6 +493,21 @@ def _extract_searchable_text(path: str, source_type: str) -> list[tuple[str, str
 
 
 # ── Cleanup helpers ────────────────────────────────────────────────────────────
+
+AUTO_GENERATED_PREFIXES = (
+    'analyze this codebase for',
+    'analyze test coverage',
+    'analyze the codebase',
+    'review this codebase for',
+    'scan this codebase',
+    'audit this codebase',
+)
+
+
+def _is_auto_generated(first_msg: str) -> bool:
+    lower = first_msg.lower().strip()
+    return any(lower.startswith(prefix) for prefix in AUTO_GENERATED_PREFIXES)
+
 
 def _dupe_key(record: dict, path: str) -> str | None:
     """
@@ -590,7 +693,11 @@ def cmd_cleanup(config: list[dict]) -> None:
         if fm_lower in LOW_SIGNAL:
             reasons.append('low-signal first message')
 
-        # Rule 3: duplicate topic (conservative — needs 3-message key match)
+        # Rule 3: auto-generated task session
+        if _is_auto_generated(r['first_msg']):
+            reasons.append('auto-generated task')
+
+        # Rule 4: duplicate topic (conservative — needs 3-message key match)
         key = _dupe_key(r, r['path'])
         if key is not None:
             if key in seen_keys:
@@ -603,6 +710,13 @@ def cmd_cleanup(config: list[dict]) -> None:
         if reasons:
             candidates.append({**r, 'reasons': reasons})
 
+        secret_types = _secret_matches(r['path'])
+        if secret_types:
+            candidates.append({
+                **r,
+                'reasons': [f'sensitive content: {", ".join(secret_types)}'],
+            })
+
     if not candidates:
         print('No cleanup candidates found.')
         return
@@ -614,9 +728,125 @@ def cmd_cleanup(config: list[dict]) -> None:
         print(f'| {i} | {r["project"]} | {r["date"]} | {r["msgs"]} '
               f'| {r["size"]} | {"; ".join(r["reasons"])} |')
     print()
-    print('To delete, confirm with the assistant and use: rm "<path>"')
+    print('To quarantine after confirmation: quarantine "<path>" --apply')
+    print('For sensitive records, redact or quarantine first; do not delete blindly.')
     for i, r in enumerate(candidates, 1):
         print(f'{i}: {r["path"]}')
+
+
+def cmd_secrets(config: list[dict], as_json: bool = False) -> None:
+    records = _gather_records(config)
+    rows = []
+    for r in records:
+        matches = _secret_matches(r['path'])
+        if matches:
+            rows.append({**r, 'secret_types': matches})
+
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    if not rows:
+        print('No credential-shaped values found in configured session files.')
+        return
+
+    print(f'Found {len(rows)} session(s) with credential-shaped values:\n')
+    print('| # | Source | Project | Date | Msgs | Size | Secret Types |')
+    print('|---|--------|---------|------|------|------|--------------|')
+    for i, r in enumerate(rows, 1):
+        print(f'| {i} | {r["source_type"]} | {r["project"]} | {r["date"]} '
+              f'| {r["msgs"]} | {r["size"]} | {", ".join(r["secret_types"])} |')
+    print()
+    print('Paths:')
+    for i, r in enumerate(rows, 1):
+        print(f'{i}: {r["path"]}')
+
+
+def cmd_redact_secrets(config: list[dict], apply: bool = False) -> None:
+    records = _gather_records(config)
+    rows = []
+
+    for r in records:
+        matches = _secret_matches(r['path'])
+        if not matches:
+            continue
+        rows.append({**r, 'secret_types': matches})
+
+    if not rows:
+        print('No credential-shaped values found in configured session files.')
+        return
+
+    if not apply:
+        print(f'Dry run: {len(rows)} session(s) would be redacted.\n')
+        for i, r in enumerate(rows, 1):
+            print(f'{i}. {r["source_type"]} | {r["project"]} | {r["date"]} | '
+                  f'{", ".join(r["secret_types"])}')
+            print(f'   {r["path"]}')
+        print('\nRun again with --apply to redact and create backups first.')
+        return
+
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    backup_root = os.path.expanduser(f'~/.claude/chat-manager-redaction-backups/{stamp}')
+    changed = 0
+    replacements_total = 0
+
+    for r in rows:
+        path = r['path']
+        try:
+            with open(path, errors='ignore') as f:
+                original = f.read()
+        except Exception as e:
+            print(f'[warn] cannot read {path}: {e}', file=sys.stderr)
+            continue
+
+        redacted, replacements = _redact_text(original)
+        if replacements == 0 or redacted == original:
+            continue
+
+        backup = _backup_path(path, backup_root)
+        Path(os.path.dirname(backup)).mkdir(parents=True, exist_ok=True)
+        with open(backup, 'w') as f:
+            f.write(original)
+        with open(path, 'w') as f:
+            f.write(redacted)
+
+        changed += 1
+        replacements_total += replacements
+
+    print(f'redacted_files={changed}')
+    print(f'replacements={replacements_total}')
+    print(f'backup_root={backup_root}')
+
+
+def cmd_quarantine(config: list[dict], path: str, apply: bool = False) -> None:
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        print(f'File not found: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    rec = _parse_record_for_path(config, path)
+
+    if not rec:
+        print(f'Could not parse session: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    quarantine_root = os.path.expanduser(f'~/.claude/chat-manager-quarantine/{stamp}')
+    dest = _backup_path(path, quarantine_root)
+
+    print(f'Session: {rec["source_type"]} | {rec["project"]} | {rec["date"]}')
+    print(f'From: {path}')
+    print(f'To:   {dest}')
+
+    if not apply:
+        print('\nDry run only. Run again with --apply to move this transcript.')
+        return
+
+    Path(os.path.dirname(dest)).mkdir(parents=True, exist_ok=True)
+    shutil.move(path, dest)
+    print('\nquarantined=true')
+    print(f'restore_command=mkdir -p {shlex.quote(os.path.dirname(path))} && '
+          f'mv {shlex.quote(dest)} {shlex.quote(path)}')
 
 
 def cmd_resume(config: list[dict], path: str) -> None:
@@ -625,16 +855,7 @@ def cmd_resume(config: list[dict], path: str) -> None:
         print(f'File not found: {path}', file=sys.stderr)
         sys.exit(1)
 
-    rec = None
-    for source in config:
-        adapter_type = source.get('type')
-        if adapter_type not in ADAPTERS:
-            continue
-        _, parse_fn = ADAPTERS[adapter_type]
-        r = parse_fn(path, source)
-        if r:
-            rec = r
-            break
+    rec = _parse_record_for_path(config, path)
 
     if not rec:
         print(f'Could not parse session: {path}', file=sys.stderr)
@@ -661,6 +882,77 @@ def cmd_resume(config: list[dict], path: str) -> None:
         print('(Codex and Claude Code sessions cannot resume each other)')
 
 
+def cmd_restore(path: str, apply: bool = False) -> None:
+    path = os.path.abspath(os.path.expanduser(path))
+    quarantine_base = os.path.expanduser('~/.claude/chat-manager-quarantine')
+
+    if not path.startswith(quarantine_base):
+        print(f'Not a quarantined file (must be under {quarantine_base})', file=sys.stderr)
+        sys.exit(1)
+
+    if not os.path.isfile(path):
+        print(f'File not found: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    rel = os.path.relpath(path, quarantine_base)
+    parts = rel.split(os.sep, 1)
+    if len(parts) < 2:
+        print(f'Cannot determine original path from: {path}', file=sys.stderr)
+        sys.exit(1)
+
+    original = os.sep + parts[1]
+
+    print(f'From: {path}')
+    print(f'To:   {original}')
+
+    if os.path.exists(original):
+        print(f'[warn] destination already exists: {original}', file=sys.stderr)
+        sys.exit(1)
+
+    if not apply:
+        print('\nDry run. Run again with --apply to restore.')
+        return
+
+    Path(os.path.dirname(original)).mkdir(parents=True, exist_ok=True)
+    shutil.move(path, original)
+    print('\nrestored=true')
+
+
+def cmd_purge_quarantine(days: int, apply: bool = False) -> None:
+    quarantine_base = os.path.expanduser('~/.claude/chat-manager-quarantine')
+    if not os.path.isdir(quarantine_base):
+        print('No quarantine directory found.')
+        return
+
+    cutoff = datetime.now().timestamp() - (days * 86400)
+    found = [p for p in glob.glob(f'{quarantine_base}/**/*.jsonl', recursive=True)
+             if os.path.getmtime(p) < cutoff]
+
+    if not found:
+        print(f'No quarantined files older than {days} days.')
+        return
+
+    total_size = sum(os.path.getsize(p) for p in found)
+    print(f'Found {len(found)} file(s) older than {days} days ({_human_size(total_size)} total):')
+    for p in found:
+        print(f'  {p}')
+
+    if not apply:
+        print(f'\nDry run. Run again with --apply to permanently delete.')
+        return
+
+    for p in found:
+        os.remove(p)
+    for dirpath, _, _ in os.walk(quarantine_base, topdown=False):
+        try:
+            os.rmdir(dirpath)
+        except OSError:
+            pass
+
+    print(f'\npurged={len(found)}')
+    print(f'freed={_human_size(total_size)}')
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -681,8 +973,31 @@ def main() -> None:
 
     sub.add_parser('cleanup', help='List cleanup candidates')
 
+    p_secrets = sub.add_parser('secrets', help='List sessions containing credential-shaped values')
+    p_secrets.add_argument('--json', action='store_true', dest='as_json',
+                           help='Output JSON rows')
+
+    p_redact = sub.add_parser('redact-secrets',
+                              help='Redact credential-shaped values from session files')
+    p_redact.add_argument('--apply', action='store_true',
+                          help='Actually modify files after creating backups')
+
+    p_quarantine = sub.add_parser('quarantine',
+                                  help='Move one session transcript into quarantine')
+    p_quarantine.add_argument('path', help='Absolute path to .jsonl file')
+    p_quarantine.add_argument('--apply', action='store_true',
+                              help='Actually move the file')
+
     p_resume = sub.add_parser('resume', help='Print resume command for a session')
     p_resume.add_argument('path', help='Absolute path to .jsonl file')
+
+    p_restore = sub.add_parser('restore', help='Restore a quarantined session to its original path')
+    p_restore.add_argument('path', help='Absolute path to quarantined .jsonl file')
+    p_restore.add_argument('--apply', action='store_true', help='Actually move the file')
+
+    p_purge = sub.add_parser('purge-quarantine', help='Permanently delete old quarantined files')
+    p_purge.add_argument('--days', type=int, default=7, help='Delete files older than N days (default: 7)')
+    p_purge.add_argument('--apply', action='store_true', help='Actually delete the files')
 
     sub.add_parser('version', help='Print version and exit')
 
@@ -702,8 +1017,18 @@ def main() -> None:
         cmd_inspect(config, args.path)
     elif args.cmd == 'cleanup':
         cmd_cleanup(config)
+    elif args.cmd == 'secrets':
+        cmd_secrets(config, as_json=args.as_json)
+    elif args.cmd == 'redact-secrets':
+        cmd_redact_secrets(config, apply=args.apply)
+    elif args.cmd == 'quarantine':
+        cmd_quarantine(config, args.path, apply=args.apply)
     elif args.cmd == 'resume':
         cmd_resume(config, args.path)
+    elif args.cmd == 'restore':
+        cmd_restore(args.path, apply=args.apply)
+    elif args.cmd == 'purge-quarantine':
+        cmd_purge_quarantine(args.days, apply=args.apply)
 
 
 if __name__ == '__main__':
