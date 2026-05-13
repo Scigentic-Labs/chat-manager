@@ -3,6 +3,7 @@
     { "type": "claude-code", "path": "~/.claude/projects/",       "machine": "local" },
     { "type": "claude-code", "path": "~/ai-chats-repo/mbp-work/", "machine": "mbp-work" },
     { "type": "claude-code", "path": "~/ai-chats-repo/mbp-home/", "machine": "mbp-home" },
-    { "type": "codex",       "path": "~/.codex/sessions/",        "machine": "local" }
+    { "type": "codex",       "path": "~/.codex/sessions/",        "machine": "local" },
+    { "type": "codex",       "path": "~/.codex/archived_sessions/", "machine": "local" }
   ]
 }
